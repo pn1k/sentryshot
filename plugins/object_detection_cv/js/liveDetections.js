@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // @ts-check
 
-import {
-	denormalize,
-	relativePathname,
-	htmlToElem,
-	sleep,
-} from "./libs/common.js";
+import { denormalize, relativePathname, htmlToElem, sleep } from "./libs/common.js";
 
 /**
  * @typedef {import("./components/feed.js").Feed} Feed
@@ -46,7 +41,7 @@ export function newLiveDetections(feed, monitor) {
 			style="
 				stroke: var(--color-red);
 				fill-opacity: 0;
-				stroke-width: calc(var(--scale) * 0.05rem);
+				stroke-width: 1.5px;
 				pointer-events: none;
 				z-index: 3;
 			"
@@ -56,8 +51,25 @@ export function newLiveDetections(feed, monitor) {
 	`);
 	$host.append($svg);
 
+	// Text labels are plain HTML: inside the stretched SVG the font would
+	// scale with the feed and get distorted.
+	/** @type {HTMLDivElement} */
+	// @ts-ignore
+	const $labels = htmlToElem(/* HTML */ `
+		<div
+			class="js-live-detections-labels absolute"
+			style="
+				pointer-events: none;
+				z-index: 3;
+				overflow: hidden;
+			"
+		></div>
+	`);
+	$host.append($labels);
+
 	// Match the video content box; the video letterboxes inside the container
-	// (object-fit: contain).
+	// (object-fit: contain). The labels container must follow the same box,
+	// or the labels would drift onto the letterbox bars.
 	const position = () => {
 		const cw = $host.clientWidth;
 		const ch = $host.clientHeight;
@@ -69,10 +81,12 @@ export function newLiveDetections(feed, monitor) {
 		const scale = Math.min(cw / vw, ch / vh);
 		const w = vw * scale;
 		const h = vh * scale;
-		$svg.style.left = `${(cw - w) / 2}px`;
-		$svg.style.top = `${(ch - h) / 2}px`;
-		$svg.style.width = `${w}px`;
-		$svg.style.height = `${h}px`;
+		for (const elem of [$svg, $labels]) {
+			elem.style.left = `${(cw - w) / 2}px`;
+			elem.style.top = `${(ch - h) / 2}px`;
+			elem.style.width = `${w}px`;
+			elem.style.height = `${h}px`;
+		}
 	};
 	$video.addEventListener("loadedmetadata", position);
 	// eslint-disable-next-line compat/compat
@@ -81,7 +95,8 @@ export function newLiveDetections(feed, monitor) {
 
 	/** @param {any[]} detections */
 	const render = (detections) => {
-		let html = "";
+		let rects = "";
+		let labels = "";
 		for (const d of detections) {
 			if (!d.region || !d.region.rectangle) {
 				continue;
@@ -91,20 +106,32 @@ export function newLiveDetections(feed, monitor) {
 			const y = denormalize(r.y, 100);
 			const width = denormalize(r.width, 100);
 			const height = denormalize(r.height, 100);
-			const textY = y > 10 ? y - 2 : y + height + 5;
-			html += `
-				<text
+
+			// The stroke is screen-space via non-scaling-stroke, so the
+			// border stays thin on any feed size.
+			rects += `
+				<rect
 					x="${x}"
-					y="${textY}"
-					font-size="5"
-					style="fill-opacity: 1; fill: var(--color-red); stroke-opacity: 0;"
-				>
-					${d.label} ${Math.round(d.score)}%
-				</text>
-				<rect x="${x}" width="${width}" y="${y}" height="${height}" />
+					width="${width}"
+					y="${y}"
+					height="${height}"
+					vector-effect="non-scaling-stroke"
+				/>
+			`;
+
+			// Label above the box, or below it when the box touches the top.
+			const above = y > 8;
+			const labelY = above ? y : y + height;
+			const shift = above ? "translateY(-100%)" : "translateY(0.3rem)";
+			labels += `
+				<div
+					class="js-live-detections-label"
+					style="left: ${x}%; top: ${labelY}%; transform: ${shift};"
+				>${d.label} ${Math.round(d.score)}%</div>
 			`;
 		}
-		$svg.innerHTML = html;
+		$svg.innerHTML = rects;
+		$labels.innerHTML = labels;
 	};
 
 	const abort = new AbortController();
@@ -142,7 +169,23 @@ export function newLiveDetections(feed, monitor) {
 			stopped = true;
 			abort.abort("cancelled");
 			$svg.remove();
+			$labels.remove();
 			feed.destroy();
 		},
 	};
 }
+
+// CSS.
+const $style = document.createElement("style");
+$style.innerHTML = /* CSS */ `
+	.js-live-detections-label {
+		position: absolute;
+		color: var(--color-red);
+		font-size: calc(var(--scale) * 0.9rem);
+		line-height: 1.1;
+		white-space: nowrap;
+		text-shadow: 0 0 3px rgba(0, 0, 0, 0.85);
+	}
+`;
+
+document.querySelector("head").append($style);

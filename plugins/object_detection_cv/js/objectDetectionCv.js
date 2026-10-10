@@ -37,122 +37,122 @@ export function objectDetectionCv(getMonitorId) {
 	};
 
 	const fields = {
-		enable: fieldTemplate.toggle("Enable CV object detection", false),
+		enable: fieldTemplate.toggle("Включить детекцию объектов (CV)", false),
 		feedRate: newNumberField(
 			{ min: 0, step: 0.1 },
-			"Feed rate (fps)",
+			"Частота анализа (кадр/с)",
 			"",
 			5,
-			"Frames per second to analyze. The sub stream is much faster to process",
+			"Сколько кадров в секунду анализировать. Суб-поток обрабатывать значительно дешевле",
 		),
 		duration: fieldTemplate.integer(
-			"Trigger duration (sec)",
+			"Длительность триггера (сек)",
 			"",
 			120,
-			"The number of seconds the recorder will be active for after an object is detected",
+			"Сколько секунд запись остаётся активной после обнаружения объекта",
 		),
 		useSubStream: fieldTemplate.toggle(
-			"Use sub stream",
+			"Использовать суб-поток",
 			true,
-			"If sub stream should be used instead of the main stream",
+			"Анализировать суб-поток вместо основного потока",
 		),
 		scale: fieldTemplate.integer(
-			"Analysis scale",
+			"Масштаб анализа",
 			"",
 			1,
-			"Downscale factor 1-8 for the analyzed luma plane. 2 halves the resolution and CPU cost",
+			"Коэффициент уменьшения 1-8 для анализируемой яркостной плоскости. 2 вдвое снижает разрешение и нагрузку на CPU",
 		),
 		mask: mask(hasSubStream, getMonitorId),
 		background: group({
 			samples: fieldTemplate.integer(
-				"Samples",
+				"Сэмплы",
 				"",
 				8,
-				"Number of background samples per pixel",
+				"Количество фоновых сэмплов на пиксель",
 			),
 			threshold: fieldTemplate.integer(
-				"Threshold",
+				"Порог",
 				"",
 				20,
-				"Luma distance for a sample to count as a match",
+				"Расстояние по яркости, при котором сэмпл считается совпадением",
 			),
 			minMatch: fieldTemplate.integer(
-				"Min match",
+				"Мин. совпадений",
 				"",
 				2,
-				"Matching samples required for a pixel to be background",
+				"Сколько сэмплов должны совпасть, чтобы пиксель считался фоном",
 			),
 			updateRate: fieldTemplate.integer(
-				"Update rate",
+				"Частота обновления",
 				"",
 				16,
-				"1 in N chance to update a pixel model each frame",
+				"Шанс 1 к N обновить модель пикселя в каждом кадре",
 			),
 		}),
 		blob: group({
 			minArea: newNumberField(
 				{ min: 0, step: 0.1 },
-				"Min area (%)",
+				"Мин. площадь (%)",
 				"",
 				0.2,
-				"Minimum blob area as a percent of the frame",
+				"Минимальная площадь блоба в процентах от кадра",
 			),
 			maxArea: newNumberField(
 				{ min: 0, step: 0.1 },
-				"Max area (%)",
+				"Макс. площадь (%)",
 				"",
 				50,
-				"Maximum blob area as a percent of the frame",
+				"Максимальная площадь блоба в процентах от кадра",
 			),
 			minAspect: newNumberField(
 				{ min: 0, step: 0.1 },
-				"Min aspect",
+				"Мин. пропорции",
 				"",
 				0.1,
-				"Minimum blob width / height ratio",
+				"Минимальное отношение ширины / высоты блоба",
 			),
 			maxAspect: newNumberField(
 				{ min: 0, step: 0.1 },
-				"Max aspect",
+				"Макс. пропорции",
 				"",
 				10,
-				"Maximum blob width / height ratio",
+				"Максимальное отношение ширины / высоты блоба",
 			),
-			open: fieldTemplate.toggle("Open", true, "Remove single-pixel speckle"),
-			close: fieldTemplate.toggle("Close", true, "Fill small holes in blobs"),
+			open: fieldTemplate.toggle("Открытие", true, "Убирает однопиксельный шум"),
+			close: fieldTemplate.toggle("Закрытие", true, "Заполняет мелкие дыры в блобах"),
 		}),
 		tracker: group({
 			minHits: fieldTemplate.integer(
-				"Min hits",
+				"Мин. попаданий",
 				"",
 				2,
-				"Consecutive frames before a track is confirmed",
+				"Подряд идущие кадры с объектом до подтверждения трека",
 			),
 			maxAge: fieldTemplate.integer(
-				"Max age (frames)",
+				"Макс. возраст (кадры)",
 				"",
 				5,
-				"Missed frames before a track is dropped",
+				"Сколько кадров без объекта ждать до удаления трека",
 			),
 			iou: newNumberField(
 				{ min: 0, step: 0.05 },
-				"Min IoU",
+				"Мин. IoU",
 				"",
 				0.3,
-				"Minimum overlap to associate a detection with a track",
+				"Минимальное пересечение, чтобы связать детекцию с треком",
 			),
 			cooldown: newNumberField(
 				{ min: 0, step: 1 },
-				"Cooldown (sec)",
+				"Пауза (сек)",
 				"",
 				5,
-				"Seconds before the same track may trigger again. Derived from the feed rate; a feed rate of 0 disables it",
+				"Секунды до повторного срабатывания того же трека. Считается из частоты анализа; feedRate = 0 отключает паузу",
 			),
 		}),
 	};
 
 	const form = newForm(fields);
-	const modal = newModal("CV object detection", [form.elem()]);
+	const modal = newModal("Детекция объектов (CV)", [form.elem()]);
 
 	let value;
 
@@ -173,7 +173,7 @@ export function objectDetectionCv(getMonitorId) {
 		modal.open();
 	};
 
-	const elem = newModalField("CV object detection", open);
+	const elem = newModalField("Детекция объектов (CV)", open);
 
 	return {
 		elems: [elem],
@@ -196,7 +196,7 @@ export function objectDetectionCv(getMonitorId) {
 			}
 			const err = form.validate();
 			if (err !== undefined) {
-				return `CV object detection: ${err}`;
+				return `Детекция объектов (CV): ${err}`;
 			}
 		},
 		// @ts-ignore
@@ -348,8 +348,8 @@ function mask(hasSubStream, getMonitorId) {
 		`<div class="flex w-full" style="min-width: 0; background: white;"></div>`,
 	);
 
-	const enable = newRawSelectField("Enable", ["true", "false"]);
-	const modal = newModal("Mask");
+	const enable = newRawSelectField("Включена", ["true", "false"]);
+	const modal = newModal("Маска");
 
 	const renderModal = () => {
 		const maskOptions = newMaskOptions();
@@ -372,9 +372,9 @@ function mask(hasSubStream, getMonitorId) {
 				//
 				`<li class="flex flex-col items-center px-2"></li>`,
 				[
-					htmlToElem(
-						`<label class="grow mr-auto text-1.5 text-color">Preview</label>`,
-					),
+				htmlToElem(
+					`<label class="grow mr-auto text-1.5 text-color">Предпросмотр</label>`,
+				),
 					htmlToElem(
 						//
 						`<div class="relative"></div>`,
@@ -478,7 +478,7 @@ function mask(hasSubStream, getMonitorId) {
 
 	let rendered = false;
 	const elem = newModalField(
-		"Mask",
+		"Маска",
 		() => {
 			if (feed !== undefined) {
 				feed.destroy();
@@ -501,7 +501,7 @@ function mask(hasSubStream, getMonitorId) {
 
 			modal.open();
 		},
-		"Mask off areas you want the detector to ignore. The dark area will be ignored.",
+		"Скройте зоны, которые детектор должен игнорировать. Тёмная область будет игнорироваться.",
 	);
 
 	return {

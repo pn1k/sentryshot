@@ -7,6 +7,16 @@ use common::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub(crate) enum ParseConfigError {
+    #[error("parse: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("invalid value: {0}")]
+    Invalid(&'static str),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ObjectDetectionCvConfig {
@@ -25,7 +35,7 @@ pub(crate) struct ObjectDetectionCvConfig {
 
 impl ObjectDetectionCvConfig {
     // Returns `None` if unset or disabled.
-    pub(crate) fn parse(raw: serde_json::Value) -> Result<Option<Self>, serde_json::Error> {
+    pub(crate) fn parse(raw: serde_json::Value) -> Result<Option<Self>, ParseConfigError> {
         #[derive(Deserialize)]
         struct Temp {
             #[serde(rename = "objectDetectionCv")]
@@ -42,6 +52,7 @@ impl ObjectDetectionCvConfig {
         if !config.enable {
             return Ok(None);
         }
+        config.validate()?;
 
         Ok(Some(Self {
             feed_rate: config.feed_rate,
@@ -85,6 +96,54 @@ struct RawConfigV1 {
     tracker: TrackerConfig,
 }
 
+impl RawConfigV1 {
+    // The `!` form also rejects NaN: every comparison with NaN is false.
+    fn validate(&self) -> Result<(), ParseConfigError> {
+        let bg = &self.background;
+        if bg.threshold < 1 {
+            return Err(ParseConfigError::Invalid(
+                "background.threshold must be at least 1",
+            ));
+        }
+        if bg.update_rate < 1 {
+            return Err(ParseConfigError::Invalid(
+                "background.updateRate must be at least 1",
+            ));
+        }
+        if !(1..=100).contains(&bg.reinit_fg) {
+            return Err(ParseConfigError::Invalid(
+                "background.reinitFg must be within 1..=100",
+            ));
+        }
+        if bg.reinit_streak < 1 {
+            return Err(ParseConfigError::Invalid(
+                "background.reinitStreak must be at least 1",
+            ));
+        }
+
+        let blob = &self.blob;
+        let bad_range = |a: f32, b: f32| a.is_nan() || b.is_nan() || a > b;
+        if bad_range(blob.min_area, blob.max_area) {
+            return Err(ParseConfigError::Invalid(
+                "blob.minArea must not exceed blob.maxArea",
+            ));
+        }
+        if bad_range(blob.min_aspect, blob.max_aspect) {
+            return Err(ParseConfigError::Invalid(
+                "blob.minAspect must not exceed blob.maxAspect",
+            ));
+        }
+
+        let tracker = &self.tracker;
+        if tracker.iou.is_nan() || !(tracker.iou > 0.0 && tracker.iou <= 1.0) {
+            return Err(ParseConfigError::Invalid(
+                "tracker.iou must be within (0, 1]",
+            ));
+        }
+        Ok(())
+    }
+}
+
 const fn default_scale() -> u8 {
     1
 }
@@ -111,6 +170,13 @@ pub(crate) struct BackgroundConfig {
 
     /// 1 in `update_rate` chance to update a pixel model each frame.
     pub(crate) update_rate: u16,
+
+    /// Foreground percent above which the frame counts as a global change:
+    /// no triggers are produced and the reinit streak grows.
+    pub(crate) reinit_fg: u8,
+
+    /// Consecutive global-change frames before the model reinitializes.
+    pub(crate) reinit_streak: u8,
 }
 
 impl Default for BackgroundConfig {
@@ -120,6 +186,8 @@ impl Default for BackgroundConfig {
             threshold: 20,
             min_match: 2,
             update_rate: 16,
+            reinit_fg: 60,
+            reinit_streak: 6,
         }
     }
 }
@@ -172,8 +240,13 @@ pub(crate) struct TrackerConfig {
     pub(crate) iou: f32,
 
     /// Seconds before the same track may trigger again. Derived from the feed
-    /// rate; a feed rate of 0 (no limit) disables the cooldown.
+    /// rate; a feed rate of `0` (no limit) disables it.
     pub(crate) cooldown: u16,
+
+    /// Seconds without significant movement after which a confirmed track is
+    /// absorbed into the background (parked car, moved furniture). `0`
+    /// disables absorption.
+    pub(crate) static_after: u16,
 }
 
 impl Default for TrackerConfig {
@@ -183,6 +256,7 @@ impl Default for TrackerConfig {
             max_age: 5,
             iou: 0.3,
             cooldown: 5,
+            static_after: 60,
         }
     }
 }
@@ -249,6 +323,8 @@ mod tests {
                 threshold: 25,
                 min_match: 2,
                 update_rate: 8,
+                reinit_fg: 60,
+                reinit_streak: 6,
             },
             blob: BlobConfig {
                 min_area: 1.0,
@@ -263,6 +339,7 @@ mod tests {
                 max_age: 4,
                 iou: 0.5,
                 cooldown: 7,
+                static_after: 60,
             },
         };
         assert_eq!(want, got);
@@ -310,6 +387,117 @@ mod tests {
             }
         });
         assert!(ObjectDetectionCvConfig::parse(raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_parse_reinit_defaults() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true,
+                "feedRate": 5,
+                "duration": 15,
+                "useSubStream": true
+            }
+        });
+        let got = ObjectDetectionCvConfig::parse(raw).unwrap().unwrap();
+        assert_eq!(60, got.background.reinit_fg);
+        assert_eq!(6, got.background.reinit_streak);
+        assert_eq!(60, got.tracker.static_after);
+    }
+
+    #[test]
+    fn test_parse_invalid_threshold() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "background": { "threshold": 0 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_update_rate() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "background": { "updateRate": 0 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_iou() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "tracker": { "iou": 0.0 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
+
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "tracker": { "iou": 1.5 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_aspect_range() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "blob": { "minAspect": 5.0, "maxAspect": 2.0 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_area_range() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "blob": { "minArea": 60.0, "maxArea": 40.0 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_reinit_fg() {
+        let raw = json!({
+            "objectDetectionCv": {
+                "enable": true, "feedRate": 5, "duration": 15, "useSubStream": true,
+                "background": { "reinitFg": 0 }
+            }
+        });
+        assert!(matches!(
+            ObjectDetectionCvConfig::parse(raw),
+            Err(ParseConfigError::Invalid(_))
+        ));
     }
 
     #[test]

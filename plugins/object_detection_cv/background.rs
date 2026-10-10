@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use crate::blobs::Bbox;
 use crate::config::BackgroundConfig;
 
 /// Deterministic xorshift64, avoids a `rand` dependency and makes tests stable.
@@ -11,23 +12,47 @@ impl Rng {
         Self(seed | 1)
     }
 
-    fn next_u32(&mut self) -> u32 {
+    fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
         self.0 = x;
-        u32::try_from(x >> 32).unwrap_or(0)
+        x
     }
 }
 
-// Reinitialize the model when nearly the whole frame stays foreground for this
-// many consecutive frames (camera move, light switch).
-const REINIT_STREAK: u32 = 12;
+/// Cheap counter-based finalizer (splitmix-style). Stateless per input, so
+/// per-pixel draws do not form a serial dependency chain and the hot loop
+/// stays pipelined.
+#[inline]
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z ^= z >> 29;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z ^= z >> 32;
+    z
+}
 
-// Foreground fraction above which the reinit streak counts up.
-const REINIT_FG_NUM: u64 = 85;
-const REINIT_FG_DEN: u64 = 100;
+/// Maps a uniform `u32` to `[0, n)` without an integer division (Lemire's
+/// fastrange).
+#[inline]
+fn fastrange(r: u32, n: u32) -> u32 {
+    u32::try_from((u64::from(r) * u64::from(n)) >> 32).unwrap_or(0)
+}
+
+#[inline]
+fn lo32(v: u64) -> u32 {
+    u32::try_from(v & 0xFFFF_FFFF).unwrap_or(0)
+}
+
+#[inline]
+fn hi32(v: u64) -> u32 {
+    u32::try_from(v >> 32).unwrap_or(0)
+}
+
+// Foreground percent above which the reinit streak counts up is configurable
+// (`reinit_fg`), as is the streak length (`reinit_streak`).
 
 /// Sample-based background model (ViBe-like).
 ///
@@ -41,63 +66,79 @@ pub(crate) struct BackgroundModel {
     samples: usize,
     threshold: u8,
     min_match: u8,
-    update_rate: u32,
+
+    // A random draw below this threshold triggers a model update, which
+    // replaces an integer division per pixel with one comparison.
+    update_threshold: u32,
 
     initialized: bool,
     models: Vec<u8>,
     rng: Rng,
 
     fg_streak: u32,
+
+    // Global-change thresholds, from the config.
+    reinit_fg: u64,
+    reinit_streak: u32,
 }
 
 impl BackgroundModel {
     pub(crate) fn new(width: usize, height: usize, config: BackgroundConfig) -> Self {
         let samples = usize::from(config.samples.max(1));
+        let update_rate = u32::from(config.update_rate.max(1));
         Self {
             width,
             height,
             samples,
             threshold: config.threshold,
             min_match: config.min_match.clamp(1, config.samples.max(1)),
-            update_rate: u32::from(config.update_rate.max(1)),
+            update_threshold: u32::MAX / update_rate,
             initialized: false,
             models: vec![0; width * height * samples],
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
             fg_streak: 0,
+            reinit_fg: u64::from(config.reinit_fg),
+            reinit_streak: u32::from(config.reinit_streak),
         }
     }
 
     /// Compares `gray` with the model, writing `0` (background) or `255`
     /// (foreground) into `mask`, then updates the model.
     ///
+    /// Returns the number of foreground pixels, so callers can skip the rest
+    /// of the pipeline on a fully static frame.
+    ///
     /// On the first frame (and after a reinit) the model is initialized from
     /// the current frame and `mask` is all background.
-    pub(crate) fn update_and_detect(&mut self, gray: &[u8], mask: &mut [u8]) {
+    pub(crate) fn update_and_detect(&mut self, gray: &[u8], mask: &mut [u8]) -> u64 {
         let n = gray.len();
         debug_assert_eq!(self.width * self.height, n, "model/frame size mismatch");
         debug_assert_eq!(mask.len(), n, "mask/frame size mismatch");
         if n == 0 {
-            return;
+            return 0;
         }
-
-        let samples = self.samples;
-        let threshold = self.threshold;
-        let min_match = u32::from(self.min_match);
 
         if !self.initialized {
             self.init_from(gray, mask);
-            return;
+            return 0;
         }
 
-        let update_rate = self.update_rate;
+        let samples = self.samples;
+        let samples_u32 = u32::try_from(samples).unwrap_or(1);
+        let threshold = self.threshold;
+        let min_match = u32::from(self.min_match);
+        let update_threshold = self.update_threshold;
+
+        // One random seed per frame; per-pixel randomness comes from hashing
+        // the pixel index, which has no carried state.
+        let seed = self.rng.next_u64();
+
         let width = self.width;
         let height = self.height;
         let models = &mut self.models;
-        let rng = &mut self.rng;
 
         let mut fg_count: u64 = 0;
-        for i in 0..n {
-            let v = gray[i];
+        for (i, &v) in gray.iter().enumerate() {
             let base = i * samples;
 
             let mut matches: u32 = 0;
@@ -119,42 +160,58 @@ impl BackgroundModel {
             }
 
             // Random sub-sampling update of a single sample.
-            let r = rng.next_u32();
-            if r % update_rate == 0 {
-                let idx = usize::try_from((r / update_rate) % u32::try_from(samples).unwrap_or(1))
-                    .unwrap_or(0);
-                models[base + idx] = v;
+            let h = mix(seed ^ u64::try_from(i).unwrap_or(0));
+            if hi32(h) >= update_threshold {
+                continue;
+            }
+            let idx = usize::try_from(fastrange(lo32(h), samples_u32)).unwrap_or(0);
+            models[base + idx] = v;
 
-                // Spatial diffusion: also update a random sample of a random
-                // neighbor so ghosts fade faster after an object leaves.
-                let r2 = rng.next_u32();
-                let dx = match r2 % 3 {
-                    0 => -1,
-                    1 => 0,
-                    _ => 1,
-                };
-                let dy = match (r2 / 3) % 3 {
-                    0 => -1,
-                    1 => 0,
-                    _ => 1,
-                };
-                let nidx =
-                    usize::try_from((r2 / 9) % u32::try_from(samples).unwrap_or(1)).unwrap_or(0);
-                if let Some(n) = neighbor_index(i, dx, dy, width, height) {
-                    models[n * samples + nidx] = v;
-                }
+            // Spatial diffusion: also update a random sample of a random
+            // neighbor so ghosts fade faster after an object leaves.
+            let h2 = mix(h);
+            let cell = fastrange(hi32(h2), 9);
+            let dx = i64::from(cell % 3) - 1;
+            let dy = i64::from(cell / 3) - 1;
+            let nidx = usize::try_from(fastrange(lo32(h2), samples_u32)).unwrap_or(0);
+            if let Some(n) = neighbor_index(i, dx, dy, width, height) {
+                models[n * samples + nidx] = v;
             }
         }
 
         // Reinit safeguard: a near-total foreground that persists means the
         // scene changed globally; rebuild the model from the current frame.
-        if fg_count * REINIT_FG_DEN > u64::try_from(n).unwrap_or(0) * REINIT_FG_NUM {
+        if fg_count * 100 > u64::try_from(n).unwrap_or(0) * self.reinit_fg {
             self.fg_streak = self.fg_streak.saturating_add(1);
-            if self.fg_streak >= REINIT_STREAK {
+            if self.fg_streak >= self.reinit_streak {
                 self.init_from(gray, mask);
             }
         } else {
             self.fg_streak = 0;
+        }
+
+        fg_count
+    }
+
+    /// Forces the model to match the current frame inside the given
+    /// rectangles, so objects that stood still stop producing foreground
+    /// (a parked car, moved furniture) instead of triggering forever.
+    pub(crate) fn absorb(&mut self, gray: &[u8], boxes: &[Bbox]) {
+        let samples = self.samples;
+        let w = self.width;
+        let h = self.height;
+        for b in boxes {
+            let x0 = usize::try_from(b.x).unwrap_or(0).min(w);
+            let y0 = usize::try_from(b.y).unwrap_or(0).min(h);
+            let x1 = usize::try_from(b.x.saturating_add(b.w)).unwrap_or(0).min(w);
+            let y1 = usize::try_from(b.y.saturating_add(b.h)).unwrap_or(0).min(h);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = y * w + x;
+                    let v = gray.get(i).copied().unwrap_or(0);
+                    self.models[i * samples..(i + 1) * samples].fill(v);
+                }
+            }
         }
     }
 
@@ -235,6 +292,36 @@ mod tests {
     }
 
     #[test]
+    fn test_background_pixel_updates_model() {
+        // updateRate 1 -> every background pixel updates its sample, so the
+        // model follows the (still in-threshold) brightness change and only a
+        // later jump beyond the threshold turns foreground.
+        let mut m = BackgroundModel::new(
+            1,
+            1,
+            BackgroundConfig {
+                samples: 1,
+                threshold: 50,
+                min_match: 1,
+                update_rate: 1,
+                reinit_fg: 60,
+                reinit_streak: 6,
+            },
+        );
+        let mut mask = vec![0; 1];
+        m.update_and_detect(&[10], &mut mask);
+        assert_eq!(vec![0], mask);
+
+        // |30 - 10| < 50: background, and the model must move to 30.
+        m.update_and_detect(&[30], &mut mask);
+        assert_eq!(vec![0], mask);
+
+        // |100 - 30| >= 50: foreground, proving the model was updated.
+        m.update_and_detect(&[100], &mut mask);
+        assert_eq!(vec![255], mask);
+    }
+
+    #[test]
     fn test_standing_object_stays_foreground() {
         let mut m = model(2, 2);
         let base = [10, 20, 30, 40];
@@ -259,7 +346,8 @@ mod tests {
 
         // Every pixel changes hugely; after the reinit streak the model is
         // rebuilt from the current frame and the scene is background again.
-        for _ in 0..REINIT_STREAK {
+        let streak = u32::from(BackgroundConfig::default().reinit_streak);
+        for _ in 0..streak {
             m.update_and_detect(&[200, 200, 200, 200], &mut mask);
         }
         m.update_and_detect(&[200, 200, 200, 200], &mut mask);
@@ -274,9 +362,59 @@ mod tests {
 
         // One foreground pixel out of four (25%) is far below the reinit
         // threshold, so the streak never accumulates.
-        for _ in 0..(REINIT_STREAK * 4) {
+        let streak = u32::from(BackgroundConfig::default().reinit_streak);
+        for _ in 0..(streak * 4) {
             m.update_and_detect(&[200, 10, 10, 10], &mut mask);
             assert_eq!(255, mask[0]);
         }
+    }
+
+    #[test]
+    fn test_absorb_removes_standing_object() {
+        let mut m = model(4, 4);
+        let mut mask = vec![0; 16];
+        let base = [10_u8; 16];
+        m.update_and_detect(&base, &mut mask);
+
+        // A 2x2 object appears at (1,1).
+        let mut frame = base;
+        for y in 1..3 {
+            for x in 1..3 {
+                frame[y * 4 + x] = 200;
+            }
+        }
+        m.update_and_detect(&frame, &mut mask);
+        assert_eq!(255, mask[5]);
+        assert_eq!(255, mask[10]);
+
+        // Absorbing its box forces the model to the current frame there.
+        m.absorb(
+            &frame,
+            &[Bbox {
+                x: 1,
+                y: 1,
+                w: 2,
+                h: 2,
+                area: 4,
+            }],
+        );
+        m.update_and_detect(&frame, &mut mask);
+        assert_eq!(vec![0; 16], mask);
+    }
+
+    #[test]
+    fn test_absorb_clamps_to_frame() {
+        let mut m = model(2, 2);
+        // A box reaching outside the frame must not panic.
+        m.absorb(
+            &[1, 2, 3, 4],
+            &[Bbox {
+                x: 1,
+                y: 1,
+                w: 100,
+                h: 100,
+                area: 1,
+            }],
+        );
     }
 }

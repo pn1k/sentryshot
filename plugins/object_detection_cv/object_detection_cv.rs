@@ -80,9 +80,11 @@ pub struct ObjectDetectionCvPlugin {
     live: LiveDetectionsMap,
 }
 
-// Current detections per monitor with an update timestamp. Entries older than
-// `LIVE_TTL` are treated as empty by the handler.
-type LiveDetectionsMap = Arc<Mutex<HashMap<MonitorId, (Instant, Vec<Detection>)>>>;
+// Current detections per monitor with an update timestamp and a freshness
+// window. Stale entries are treated as empty by the handler. Detections are
+// shared through an `Arc` so publishing a frame is a refcount bump and the
+// handler clones nothing but the `Arc` under the lock.
+type LiveDetectionsMap = Arc<Mutex<HashMap<MonitorId, (Instant, Duration, Arc<Vec<Detection>>)>>>;
 
 const LIVE_TTL: Duration = Duration::from_secs(2);
 
@@ -116,11 +118,23 @@ impl Plugin for ObjectDetectionCvPlugin {
         });
 
         if let Err(e) = self
-            .start(token, msg_logger.clone(), self.live.clone(), monitor)
+            .start(
+                token,
+                msg_logger.clone(),
+                self.live.clone(),
+                monitor.clone(),
+            )
             .await
         {
             msg_logger.log(LogLevel::Error, &format!("start: {e}"));
         }
+
+        // The monitor stopped: drop its live-overlay entry so the map does
+        // not grow without bound.
+        self.live
+            .lock()
+            .expect("live detections mutex")
+            .remove(&monitor.config().id().to_owned());
     }
 
     fn route(&self, router: Router) -> Router {
@@ -160,7 +174,7 @@ impl MsgLogger for CvLogger {
 #[derive(Debug, Error)]
 enum StartError {
     #[error("parse config: {0}")]
-    ParseConfig(#[from] serde_json::Error),
+    ParseConfig(#[from] crate::config::ParseConfigError),
 
     #[error("failed to get sub-stream")]
     GetSubStream,
@@ -182,6 +196,9 @@ enum RunError {
 
     #[error("send event: {0}")]
     SendEvent(#[from] CreateEventDbError),
+
+    #[error("detector panicked: {0}")]
+    DetectorPanic(String),
 
     #[error("input size zero")]
     InputSizeZero,
@@ -279,6 +296,11 @@ impl ObjectDetectionCvPlugin {
         let label: Label = "object".to_owned().try_into().expect("valid");
         let monitor_id = monitor.config().id().to_owned();
 
+        // Live-overlay freshness window: a few frame periods at least, so a
+        // low feed rate does not make the overlay flicker between polls.
+        let period = u64::try_from(DurationH264::from(*config.feed_rate).as_nanos()).unwrap_or(0);
+        let ttl = LIVE_TTL.max(Duration::from_nanos(period).saturating_mul(3));
+
         loop {
             let Some(frame) = feed.recv().await else {
                 // Feed was cancelled.
@@ -287,22 +309,33 @@ impl ObjectDetectionCvPlugin {
             let frame = frame?;
             let time = UnixNano::from(UnixH264::new(frame.pts()));
 
-            let (det, triggers) = self
+            let (det, triggers) = match self
                 .rt_handle
                 .spawn_blocking(move || {
                     let result = detector.step(&frame);
                     (detector, result)
                 })
                 .await
-                .expect("join");
+            {
+                Ok(v) => v,
+                // A panic inside the detector must not take the plugin down:
+                // surface it as an error so `run` restarts cleanly.
+                Err(e) => return Err(RunError::DetectorPanic(e.to_string())),
+            };
             detector = det;
             let triggers = triggers?;
 
             // Publish the current state for the live overlay.
-            live.lock().expect("live detections mutex").insert(
-                monitor_id.clone(),
-                (Instant::now(), detector.current().to_vec()),
-            );
+            let current = detector.current();
+            {
+                let mut map = live.lock().expect("live detections mutex");
+                if let Some(entry) = map.get_mut(&monitor_id) {
+                    entry.0 = Instant::now();
+                    entry.2 = current;
+                } else {
+                    map.insert(monitor_id.clone(), (Instant::now(), ttl, current));
+                }
+            }
 
             if triggers.is_empty() {
                 continue;
@@ -344,11 +377,11 @@ async fn live_detections_handler(
     let detections = {
         let map = s.live.lock().expect("live detections mutex");
         match map.get(&monitor_id) {
-            Some((at, detections)) if at.elapsed() < LIVE_TTL => detections.clone(),
-            _ => Vec::new(),
+            Some((at, ttl, detections)) if at.elapsed() < *ttl => Arc::clone(detections),
+            _ => Arc::new(Vec::new()),
         }
     };
-    Json(detections).into_response()
+    Json(detections.as_slice()).into_response()
 }
 
 fn modify_settings_js(tpl: Vec<u8>) -> Vec<u8> {
