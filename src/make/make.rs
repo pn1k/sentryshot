@@ -133,7 +133,7 @@ const PLUGINS: [&str; 7] = [
     "motion",
     "mqtt",
     "object_detection",
-    "object_detection_tflite",
+    "object_detection_cv",
     "thumb_scale",
 ];
 
@@ -211,16 +211,6 @@ fn build_target(sh: &Shell, target_dir: &Path, target: &str) {
     copy_to_libs(&fflibs.join("libavutil.so.58"));
     println!("./build/{target}/libs/libavcodec.so");
     copy_to_libs(&fflibs.join("libavcodec.so.60"));
-
-    println!("./build/{target}/libs/libtensorflowlite_c.so");
-    copy_to_libs(&get_env("TFLITELIB").join("libtensorflowlite_c.so"));
-
-    println!("./build/{target}/libs/libedgetpu.so.1");
-    std::fs::copy(
-        get_env("EDGETPULIB").join("libedgetpu.so.1.0"),
-        output_dir.join("libs").join("libedgetpu.so.1"),
-    )
-    .unwrap();
 
     println!("./build/{target}/libs/libopenh264.so.6");
     copy_to_libs(&get_env("OPENH264LIB").join("libopenh264.so.6"));

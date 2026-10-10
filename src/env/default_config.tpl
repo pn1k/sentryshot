@@ -48,6 +48,13 @@ name = "object_detection"
 enable = false
 
 
+# Object detection using classical computer vision.
+# Lightweight background model + blob tracker, designed for weak CPUs.
+[[plugin]]
+name = "object_detection_cv"
+enable = false
+
+
 # Thumbnail downscaling.
 # Downscale video thumbnails to improve page load times and data usage.
 [[plugin]]

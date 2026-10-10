@@ -5,7 +5,7 @@ members = [
 	"plugins/motion",
 	"plugins/mqtt",
 	"plugins/object_detection",
-	"plugins/object_detection_tflite",
+	"plugins/object_detection_cv",
 	"plugins/thumb_scale",
 
 	"src/make",
@@ -114,7 +114,7 @@ strip = true
 strip = true
 [profile.release.package.object_detection]
 strip = true
-[profile.release.package.object_detection_tflite]
+[profile.release.package.object_detection_cv]
 strip = true
 [profile.release.package.thumb_scale]
 strip = true

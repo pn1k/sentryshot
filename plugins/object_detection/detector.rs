@@ -207,6 +207,16 @@ async fn parse_detector_configs(
         let label_map = label_cache.get(&cpu.label_map).await?;
         if detector_configs.contains_key(&cpu.name) {
             return Err(Duplicate(cpu.name));
+        }
+        let backend = match backend_loader.tflite_backend() {
+            Ok(v) => v,
+            Err(e) => {
+                logger.log(
+                    LogLevel::Warning,
+                    &format!("skipping detector '{}': {e}", cpu.name),
+                );
+                continue;
+            }
         };
         let config = DetectorConfig {
             width: cpu.width,
@@ -214,8 +224,7 @@ async fn parse_detector_configs(
             labels: label_map.values().cloned().collect(),
         };
         detector_configs.insert(cpu.name.clone(), config);
-        let detector = backend_loader
-            .tflite_backend()?
+        let detector = backend
             .new_tflite_detector(
                 &task_token,
                 &logger,
@@ -245,6 +254,16 @@ async fn parse_detector_configs(
         let label_map = label_cache.get(&edgetpu.label_map).await?;
         if detector_configs.contains_key(&edgetpu.name) {
             return Err(Duplicate(edgetpu.name));
+        }
+        let backend = match backend_loader.tflite_backend() {
+            Ok(v) => v,
+            Err(e) => {
+                logger.log(
+                    LogLevel::Warning,
+                    &format!("skipping detector '{}': {e}", edgetpu.name),
+                );
+                continue;
+            }
         };
         let config = DetectorConfig {
             width: edgetpu.width,
@@ -252,8 +271,7 @@ async fn parse_detector_configs(
             labels: label_map.values().cloned().collect(),
         };
         detector_configs.insert(edgetpu.name.clone(), config);
-        let detector = backend_loader
-            .tflite_backend()?
+        let detector = backend
             .new_edgetpu_detector(
                 task_token.clone(),
                 &logger,
@@ -324,11 +342,10 @@ threads = 1
         )
         .await;
 
-        match result {
-            Err(DetectorManagerError::LoadTfliteBackend(_)) => {}
-            Err(e) => panic!("wrong error {e:?}"),
-            _ => panic!("expected error"),
-        };
+        // Without the tflite backend the detector is skipped, not an error.
+        let manager = result.unwrap();
+        assert!(manager.detectors.is_empty());
+        assert!(manager.configs.is_empty());
     }
 
     #[tokio::test]
@@ -402,11 +419,10 @@ threads = 1
         )
         .await;
 
-        match result {
-            Err(DetectorManagerError::LoadTfliteBackend(_)) => {}
-            Err(e) => panic!("wrong error {e:?}"),
-            _ => panic!("expected error"),
-        };
+        // Without the tflite backend the detector is skipped, not an error.
+        let manager = result.unwrap();
+        assert!(manager.detectors.is_empty());
+        assert!(manager.configs.is_empty());
     }
 
     #[test]

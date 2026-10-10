@@ -1,0 +1,32 @@
+[package]
+name = "object_detection_cv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "object_detection_cv"
+path = "object_detection_cv.rs"
+crate-type = ["cdylib"]
+doctest = false
+
+[dependencies]
+common.path = "../../src/common"
+plugin.path = "../../src/plugin"
+
+async-trait.workspace = true
+axum.workspace = true
+sentryshot_convert.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+test-case.workspace = true
