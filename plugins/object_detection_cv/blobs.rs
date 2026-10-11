@@ -17,10 +17,10 @@ pub(crate) struct Blobs {
     labels: Vec<u32>,
     parent: Vec<u32>,
     area: Vec<u32>,
-    min_x: Vec<u32>,
-    min_y: Vec<u32>,
-    max_x: Vec<u32>,
-    max_y: Vec<u32>,
+    min_x: Vec<usize>,
+    min_y: Vec<usize>,
+    max_x: Vec<usize>,
+    max_y: Vec<usize>,
     boxes: Vec<Bbox>,
 }
 
@@ -75,9 +75,9 @@ impl Blobs {
         self.area.clear();
         self.area.resize(count, 0);
         self.min_x.clear();
-        self.min_x.resize(count, u32::MAX);
+        self.min_x.resize(count, usize::MAX);
         self.min_y.clear();
-        self.min_y.resize(count, u32::MAX);
+        self.min_y.resize(count, usize::MAX);
         self.max_x.clear();
         self.max_x.resize(count, 0);
         self.max_y.clear();
@@ -95,13 +95,16 @@ impl Blobs {
             if area < min_area || area > max_area {
                 continue;
             }
+            // Coordinates are tracked as usize during labeling; convert once
+            // per blob here instead of once per pixel.
             let x0 = self.min_x[r];
             let y0 = self.min_y[r];
+            let to_u32 = |v: usize| u32::try_from(v).unwrap_or(u32::MAX);
             self.boxes.push(Bbox {
-                x: x0,
-                y: y0,
-                w: self.max_x[r] - x0 + 1,
-                h: self.max_y[r] - y0 + 1,
+                x: to_u32(x0),
+                y: to_u32(y0),
+                w: to_u32(self.max_x[r] - x0 + 1),
+                h: to_u32(self.max_y[r] - y0 + 1),
                 area,
             });
         }
@@ -162,19 +165,18 @@ impl Blobs {
                     continue;
                 }
                 let r = pidx(find(parent, l));
-                let (xu, yu) = (u32::try_from(x).unwrap_or(0), u32::try_from(y).unwrap_or(0));
                 area[r] += 1;
-                if xu < min_x[r] {
-                    min_x[r] = xu;
+                if x < min_x[r] {
+                    min_x[r] = x;
                 }
-                if yu < min_y[r] {
-                    min_y[r] = yu;
+                if y < min_y[r] {
+                    min_y[r] = y;
                 }
-                if xu > max_x[r] {
-                    max_x[r] = xu;
+                if x > max_x[r] {
+                    max_x[r] = x;
                 }
-                if yu > max_y[r] {
-                    max_y[r] = yu;
+                if y > max_y[r] {
+                    max_y[r] = y;
                 }
             }
         }
@@ -296,6 +298,16 @@ fn store8(s: &mut [u8], v: u64) {
     s.copy_from_slice(&v.to_le_bytes());
 }
 
+#[inline]
+fn load16(s: &[u8]) -> u128 {
+    u128::from_le_bytes(s.try_into().expect("16 bytes"))
+}
+
+#[inline]
+fn store16(s: &mut [u8], v: u128) {
+    s.copy_from_slice(&v.to_le_bytes());
+}
+
 /// 3x3 erosion: a pixel survives only if the whole 3x3 neighborhood is set.
 ///
 /// Mask bytes are 0 or 255, so bitwise AND implements erosion. The interior
@@ -315,6 +327,20 @@ pub(crate) fn erode3(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
                 let down = &src[row + w..row + 2 * w];
                 let out = &mut dst[row + 1..row + w - 1];
                 let mut x = 0;
+                // 16 pixels per iteration; the sub-16 tail uses the 8-byte
+                // word path below.
+                while x + 16 <= out.len() {
+                    let a =
+                        load16(&up[x..x + 16]) & load16(&mid[x..x + 16]) & load16(&down[x..x + 16]);
+                    let b = load16(&up[x + 1..x + 17])
+                        & load16(&mid[x + 1..x + 17])
+                        & load16(&down[x + 1..x + 17]);
+                    let c = load16(&up[x + 2..x + 18])
+                        & load16(&mid[x + 2..x + 18])
+                        & load16(&down[x + 2..x + 18]);
+                    store16(&mut out[x..x + 16], a & b & c);
+                    x += 16;
+                }
                 while x + 8 <= out.len() {
                     let a = load8(&up[x..x + 8]) & load8(&mid[x..x + 8]) & load8(&down[x..x + 8]);
                     let b = load8(&up[x + 1..x + 9])
@@ -358,6 +384,20 @@ pub(crate) fn dilate3(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
                 let down = &src[row + w..row + 2 * w];
                 let out = &mut dst[row + 1..row + w - 1];
                 let mut x = 0;
+                // 16 pixels per iteration; the sub-16 tail uses the 8-byte
+                // word path below.
+                while x + 16 <= out.len() {
+                    let a =
+                        load16(&up[x..x + 16]) | load16(&mid[x..x + 16]) | load16(&down[x..x + 16]);
+                    let b = load16(&up[x + 1..x + 17])
+                        | load16(&mid[x + 1..x + 17])
+                        | load16(&down[x + 1..x + 17]);
+                    let c = load16(&up[x + 2..x + 18])
+                        | load16(&mid[x + 2..x + 18])
+                        | load16(&down[x + 2..x + 18]);
+                    store16(&mut out[x..x + 16], a | b | c);
+                    x += 16;
+                }
                 while x + 8 <= out.len() {
                     let a = load8(&up[x..x + 8]) | load8(&mid[x..x + 8]) | load8(&down[x..x + 8]);
                     let b = load8(&up[x + 1..x + 9])
@@ -390,6 +430,60 @@ pub(crate) fn dilate3(src: &[u8], dst: &mut [u8], w: usize, h: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Manual morphology benchmark: 4 full-frame passes per iteration, the
+    /// same work as open+close on a 640x360 mask with ~5% foreground.
+    #[test]
+    #[ignore = "manual performance check"]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::as_conversions,
+        clippy::unwrap_used,
+        clippy::unseparated_literal_suffix
+    )]
+    fn bench_morph() {
+        let (w, h) = (640, 360);
+        let mut seed: u64 = 0x5EED;
+        let src: Vec<u8> = (0..w * h)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                if (seed >> 33) % 20 == 0 { 255 } else { 0 }
+            })
+            .collect();
+        // Thicken the noise into 3x3 seeds so the morphology output is non-trivial.
+        let src: Vec<u8> = {
+            let mut out = vec![0_u8; w * h];
+            for y in 1..h - 1 {
+                for x in 1..w - 1 {
+                    if src[y * w + x] != 0 {
+                        for dy in 0..3 {
+                            for dx in 0..3 {
+                                out[(y + dy - 1) * w + x + dx - 1] = 255;
+                            }
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let mut a = vec![0_u8; w * h];
+        let mut b = vec![0_u8; w * h];
+        let iters = 300;
+        let started = std::time::Instant::now();
+        for _ in 0..iters {
+            erode3(&src, &mut a, w, h);
+            dilate3(&a, &mut b, w, h);
+            dilate3(&b, &mut a, w, h);
+            erode3(&a, &mut b, w, h);
+        }
+        let ms = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iters);
+        println!(
+            "morph: {ms:.3} ms/iteration (4 passes), checksum {}",
+            b.iter().map(|&v| u64::from(v)).sum::<u64>()
+        );
+    }
 
     fn to_text(mask: &[u8], w: usize, h: usize) -> String {
         let mut s = String::new();

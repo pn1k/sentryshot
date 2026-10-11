@@ -72,7 +72,13 @@ pub(crate) struct BackgroundModel {
     update_threshold: u32,
 
     initialized: bool,
+    // Sample-major (SoA) layout: plane `k` is `models[k * n..(k + 1) * n]`
+    // and holds sample `k` of every pixel. Each plane is streamed linearly,
+    // which lets the compiler vectorize the per-sample comparison.
+    n: usize,
     models: Vec<u8>,
+    // Per-pixel count of matching samples for the current frame.
+    matches: Vec<u8>,
     rng: Rng,
 
     fg_streak: u32,
@@ -86,6 +92,7 @@ impl BackgroundModel {
     pub(crate) fn new(width: usize, height: usize, config: BackgroundConfig) -> Self {
         let samples = usize::from(config.samples.max(1));
         let update_rate = u32::from(config.update_rate.max(1));
+        let n = width * height;
         Self {
             width,
             height,
@@ -94,12 +101,19 @@ impl BackgroundModel {
             min_match: config.min_match.clamp(1, config.samples.max(1)),
             update_threshold: u32::MAX / update_rate,
             initialized: false,
-            models: vec![0; width * height * samples],
+            n,
+            models: vec![0; n * samples],
+            matches: vec![0; n],
             rng: Rng::new(0x9E37_79B9_7F4A_7C15),
             fg_streak: 0,
             reinit_fg: u64::from(config.reinit_fg),
             reinit_streak: u32::from(config.reinit_streak),
         }
+    }
+
+    fn plane_mut(&mut self, k: usize) -> &mut [u8] {
+        let n = self.n;
+        &mut self.models[k * n..(k + 1) * n]
     }
 
     /// Compares `gray` with the model, writing `0` (background) or `255`
@@ -126,7 +140,7 @@ impl BackgroundModel {
         let samples = self.samples;
         let samples_u32 = u32::try_from(samples).unwrap_or(1);
         let threshold = self.threshold;
-        let min_match = u32::from(self.min_match);
+        let min_match = self.min_match;
         let update_threshold = self.update_threshold;
 
         // One random seed per frame; per-pixel randomness comes from hashing
@@ -135,37 +149,46 @@ impl BackgroundModel {
 
         let width = self.width;
         let height = self.height;
-        let models = &mut self.models;
+        let plane_len = self.n;
+        let Self {
+            models, matches, ..
+        } = self;
 
-        let mut fg_count: u64 = 0;
-        for (i, &v) in gray.iter().enumerate() {
-            let base = i * samples;
-
-            let mut matches: u32 = 0;
-            for k in 0..samples {
-                if u8::abs_diff(v, models[base + k]) < threshold {
-                    matches += 1;
-                    if matches >= min_match {
-                        break;
-                    }
-                }
+        // Phase A: count matching samples per pixel. Plane-major loops with
+        // no early exit and branch-free compares, so the compiler vectorizes
+        // them for any target without intrinsics.
+        matches.fill(0);
+        for k in 0..samples {
+            let plane = &models[k * plane_len..(k + 1) * plane_len];
+            for ((m, &v), &s) in matches.iter_mut().zip(gray).zip(plane) {
+                // |v - s| < threshold, with abs_diff = max - min (no wrap).
+                *m += u8::from(u8::abs_diff(v, s) < threshold);
             }
-            let is_foreground = matches < min_match;
-            mask[i] = u8::from(is_foreground) * 255;
-            if is_foreground {
-                fg_count += 1;
-                // Foreground pixels never update the model so a stationary
-                // object is not absorbed into the background.
+        }
+
+        // Phase B: foreground mask and count. `matches <= samples <= 255`,
+        // so the u8 counter cannot overflow.
+        let mut fg_count: u64 = 0;
+        for (out, &m) in mask.iter_mut().zip(matches.iter()) {
+            let is_foreground = m < min_match;
+            *out = if is_foreground { 255 } else { 0 };
+            fg_count += u64::from(is_foreground);
+        }
+
+        // Phase C: sparse model update, scalar. Only background pixels take
+        // part; foreground never updates so a stationary object is not
+        // absorbed into the background.
+        for (i, (&v, &out)) in gray.iter().zip(mask.iter()).enumerate() {
+            if out != 0 {
                 continue;
             }
-
             // Random sub-sampling update of a single sample.
             let h = mix(seed ^ u64::try_from(i).unwrap_or(0));
             if hi32(h) >= update_threshold {
                 continue;
             }
             let idx = usize::try_from(fastrange(lo32(h), samples_u32)).unwrap_or(0);
-            models[base + idx] = v;
+            models[idx * plane_len + i] = v;
 
             // Spatial diffusion: also update a random sample of a random
             // neighbor so ghosts fade faster after an object leaves.
@@ -174,8 +197,8 @@ impl BackgroundModel {
             let dx = i64::from(cell % 3) - 1;
             let dy = i64::from(cell / 3) - 1;
             let nidx = usize::try_from(fastrange(lo32(h2), samples_u32)).unwrap_or(0);
-            if let Some(n) = neighbor_index(i, dx, dy, width, height) {
-                models[n * samples + nidx] = v;
+            if let Some(nb) = neighbor_index(i, dx, dy, width, height) {
+                models[nidx * plane_len + nb] = v;
             }
         }
 
@@ -205,21 +228,21 @@ impl BackgroundModel {
             let y0 = usize::try_from(b.y).unwrap_or(0).min(h);
             let x1 = usize::try_from(b.x.saturating_add(b.w)).unwrap_or(0).min(w);
             let y1 = usize::try_from(b.y.saturating_add(b.h)).unwrap_or(0).min(h);
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let i = y * w + x;
-                    let v = gray.get(i).copied().unwrap_or(0);
-                    self.models[i * samples..(i + 1) * samples].fill(v);
+            for k in 0..samples {
+                let plane = self.plane_mut(k);
+                for y in y0..y1 {
+                    let row = y * w;
+                    for x in x0..x1 {
+                        plane[row + x] = gray.get(row + x).copied().unwrap_or(0);
+                    }
                 }
             }
         }
     }
 
     fn init_from(&mut self, gray: &[u8], mask: &mut [u8]) {
-        let samples = self.samples;
-        for (i, &v) in gray.iter().enumerate() {
-            let base = i * samples;
-            self.models[base..base + samples].fill(v);
+        for k in 0..self.samples {
+            self.plane_mut(k).copy_from_slice(gray);
         }
         self.initialized = true;
         self.fg_streak = 0;
@@ -416,5 +439,224 @@ mod tests {
                 area: 1,
             }],
         );
+    }
+
+    /// Reference implementation: the original array-of-structs model
+    /// (`models[i * samples + k]`, indexed by pixel first) with the fused
+    /// per-pixel loop, kept
+    /// verbatim so the `SoA` rewrite can be checked bit for bit.
+    struct AosReference {
+        width: usize,
+        height: usize,
+        samples: usize,
+        threshold: u8,
+        min_match: u8,
+        update_threshold: u32,
+        initialized: bool,
+        models: Vec<u8>,
+        rng: Rng,
+        fg_streak: u32,
+        reinit_fg: u64,
+        reinit_streak: u32,
+    }
+
+    impl AosReference {
+        fn new(width: usize, height: usize, config: BackgroundConfig) -> Self {
+            let samples = usize::from(config.samples.max(1));
+            let update_rate = u32::from(config.update_rate.max(1));
+            Self {
+                width,
+                height,
+                samples,
+                threshold: config.threshold,
+                min_match: config.min_match.clamp(1, config.samples.max(1)),
+                update_threshold: u32::MAX / update_rate,
+                initialized: false,
+                models: vec![0; width * height * samples],
+                rng: Rng::new(0x9E37_79B9_7F4A_7C15),
+                fg_streak: 0,
+                reinit_fg: u64::from(config.reinit_fg),
+                reinit_streak: u32::from(config.reinit_streak),
+            }
+        }
+
+        fn init_from(&mut self, gray: &[u8], mask: &mut [u8]) {
+            let samples = self.samples;
+            for (i, &v) in gray.iter().enumerate() {
+                let base = i * samples;
+                self.models[base..base + samples].fill(v);
+            }
+            self.initialized = true;
+            self.fg_streak = 0;
+            mask[..gray.len()].fill(0);
+        }
+
+        fn absorb(&mut self, gray: &[u8], boxes: &[Bbox]) {
+            let samples = self.samples;
+            let w = self.width;
+            let h = self.height;
+            for b in boxes {
+                let x0 = usize::try_from(b.x).unwrap_or(0).min(w);
+                let y0 = usize::try_from(b.y).unwrap_or(0).min(h);
+                let x1 = usize::try_from(b.x.saturating_add(b.w)).unwrap_or(0).min(w);
+                let y1 = usize::try_from(b.y.saturating_add(b.h)).unwrap_or(0).min(h);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let i = y * w + x;
+                        let v = gray.get(i).copied().unwrap_or(0);
+                        self.models[i * samples..(i + 1) * samples].fill(v);
+                    }
+                }
+            }
+        }
+
+        fn update_and_detect(&mut self, gray: &[u8], mask: &mut [u8]) -> u64 {
+            let n = gray.len();
+            if n == 0 {
+                return 0;
+            }
+            if !self.initialized {
+                self.init_from(gray, mask);
+                return 0;
+            }
+
+            let samples = self.samples;
+            let samples_u32 = u32::try_from(samples).unwrap_or(1);
+            let threshold = self.threshold;
+            let min_match = u32::from(self.min_match);
+            let update_threshold = self.update_threshold;
+            let seed = self.rng.next_u64();
+            let width = self.width;
+            let height = self.height;
+            let models = &mut self.models;
+
+            // Phase 1: classify every pixel against the model as it stood
+            // at the start of the frame.
+            let mut fg_count: u64 = 0;
+            for (i, &v) in gray.iter().enumerate() {
+                let base = i * samples;
+                let mut matches: u32 = 0;
+                for k in 0..samples {
+                    if u8::abs_diff(v, models[base + k]) < threshold {
+                        matches += 1;
+                        if matches >= min_match {
+                            break;
+                        }
+                    }
+                }
+                let is_foreground = matches < min_match;
+                mask[i] = u8::from(is_foreground) * 255;
+                if is_foreground {
+                    fg_count += 1;
+                }
+            }
+
+            // Phase 2: model updates for background pixels only.
+            for (i, &v) in gray.iter().enumerate() {
+                if mask[i] != 0 {
+                    continue;
+                }
+                let base = i * samples;
+                let h = mix(seed ^ u64::try_from(i).unwrap_or(0));
+                if hi32(h) >= update_threshold {
+                    continue;
+                }
+                let idx = usize::try_from(fastrange(lo32(h), samples_u32)).unwrap_or(0);
+                models[base + idx] = v;
+                let h2 = mix(h);
+                let cell = fastrange(hi32(h2), 9);
+                let dx = i64::from(cell % 3) - 1;
+                let dy = i64::from(cell / 3) - 1;
+                let nidx = usize::try_from(fastrange(lo32(h2), samples_u32)).unwrap_or(0);
+                if let Some(nb) = neighbor_index(i, dx, dy, width, height) {
+                    models[nb * samples + nidx] = v;
+                }
+            }
+
+            if fg_count * 100 > u64::try_from(n).unwrap_or(0) * self.reinit_fg {
+                self.fg_streak = self.fg_streak.saturating_add(1);
+                if self.fg_streak >= self.reinit_streak {
+                    self.init_from(gray, mask);
+                }
+            } else {
+                self.fg_streak = 0;
+            }
+            fg_count
+        }
+
+        // Model value of sample `k` for pixel `i`, in plane-independent terms.
+        fn sample(&self, i: usize, k: usize) -> u8 {
+            self.models[i * self.samples + k]
+        }
+    }
+
+    /// Deterministic scene: noisy static background, a moving block, a
+    /// block that stops and gets absorbed, and a global brightness jump
+    /// that forces a reinit.
+    fn scene_frame(w: usize, h: usize, t: usize) -> Vec<u8> {
+        let mut seed: u64 = 0xDEAD_BEEF ^ u64::try_from(t).unwrap_or(0).wrapping_mul(0x1234_5679);
+        let mut px = vec![0_u8; w * h];
+        for v in &mut px {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *v = u8::try_from(100 + (seed >> 33) % 6).unwrap_or(100);
+        }
+        // Moving block for the first 120 frames, then parked at a fixed spot.
+        let bx = if t < 120 { 4 + (t * 3) % (w - 20) } else { 40 };
+        for y in 10..26 {
+            for x in bx..bx + 14 {
+                px[y * w + x] = 220;
+            }
+        }
+        // Global lighting jump after frame 200 (triggers reinit).
+        if (200..230).contains(&t) {
+            for v in &mut px {
+                *v = v.saturating_add(90);
+            }
+        }
+        px
+    }
+
+    #[test]
+    fn test_soa_matches_aos_reference_bit_exact() {
+        let (w, h) = (48, 32);
+        let config = BackgroundConfig::default();
+        let mut new = BackgroundModel::new(w, h, config);
+        let mut reference = AosReference::new(w, h, config);
+        let mut mask_new = vec![0; w * h];
+        let mut mask_ref = vec![0; w * h];
+
+        for t in 0..300 {
+            let frame = scene_frame(w, h, t);
+            let fg_new = new.update_and_detect(&frame, &mut mask_new);
+            let fg_ref = reference.update_and_detect(&frame, &mut mask_ref);
+            assert_eq!(fg_ref, fg_new, "fg_count diverged at frame {t}");
+            assert_eq!(mask_ref, mask_new, "mask diverged at frame {t}");
+
+            // Model state must match too, not only the outputs.
+            for i in 0..w * h {
+                for k in 0..new.samples {
+                    assert_eq!(
+                        reference.sample(i, k),
+                        new.models[k * new.n + i],
+                        "model diverged at frame {t}, pixel {i}, sample {k}"
+                    );
+                }
+            }
+
+            // Park an object at frame 150 to exercise absorb() as well.
+            if t == 150 {
+                let b = Bbox {
+                    x: 40,
+                    y: 10,
+                    w: 14,
+                    h: 16,
+                    area: 224,
+                };
+                new.absorb(&frame, &[b]);
+                reference.absorb(&frame, &[b]);
+            }
+        }
     }
 }
